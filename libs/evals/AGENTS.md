@@ -84,13 +84,13 @@ and supports its own `--json` flag for compact stdout output.
 | Code | Meaning                                                                                                                                                                                                                          |
 | ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `0`  | Success.                                                                                                                                                                                                                         |
-| `1`  | Eval failures. `run` saw a non-zero `pytest` exit; `trials` / `aggregate` produced a summary whose aggregated `counts.failed.mean` is greater than zero; `radar` failed.                                                         |
+| `1`  | Eval failures. `run` saw a non-zero `pytest` exit or a report with failed evals; `trials` / `aggregate` produced a summary whose aggregated `counts.failed.mean` is greater than zero; `radar` failed.                          |
 | `2`  | Configuration error: missing `--model`, model-registry import failed, or a `--check` drift detector (`catalog --check`, `model-groups --check`) found that a generated file is stale. `argparse` usage errors also exit `2`.     |
-| `3`  | No usable reports: `trials` / `aggregate` produced no summary, or `--retry-failed` could not parse any prior reports.                                                                                                            |
+| `3`  | No usable reports: `run` produced no readable report, `trials` / `aggregate` produced no summary, or `--retry-failed` could not parse any prior reports.                                                                            |
 
 Use these codes to drive automation; do not parse human-readable output.
 
-The `pytest_reporter` plugin rewrites the per-trial pytest exit status to `0` even when individual evals fail (so a CI shell step doesn't fail the workflow). The CLI therefore reads `trials_summary.json`'s aggregated `counts.failed.mean` to decide whether to return `1`, not the per-trial `pytest_returncode` field.
+The `pytest_reporter` plugin rewrites the per-trial pytest exit status to `0` even when individual evals fail (so a CI shell step doesn't fail the workflow). The CLI reads the single-run report's `failed` count for `run` and `trials_summary.json`'s aggregated `counts.failed.mean` for `trials` / `aggregate` to decide whether to return `1`.
 
 ## Required environment
 

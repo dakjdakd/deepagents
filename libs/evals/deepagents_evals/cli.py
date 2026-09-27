@@ -15,13 +15,14 @@ Subcommands:
 
 Exit codes:
     0   Success.
-    1   Eval failures: `run` saw a non-zero pytest exit, or `trials` /
+    1   Eval failures: `run` saw a non-zero pytest exit or a failed eval, or `trials` /
         `aggregate` produced a summary whose aggregated `counts.failed.mean`
         is greater than zero. `radar` non-zero exits also map here.
     2   Configuration error: missing `--model`, registry-load failure, or
         a `--check` drift detector found that a generated file is stale.
-    3   No usable reports: `trials` / `aggregate` produced no summary,
-        or `--retry-failed` could not parse any prior reports.
+    3   No usable reports: `run` produced no readable report, `trials` /
+        `aggregate` produced no summary, or `--retry-failed` could not parse
+        any prior reports.
 
 Most subcommands accept `--json` for structured stdout and `--dry-run` for
 preview-only execution.
@@ -32,9 +33,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -46,17 +49,17 @@ EXIT_OK = 0
 EXIT_EVAL_FAILURES = 1
 """At least one test failed in this run.
 
-For `run`, set when `pytest` exited non-zero. For `trials` / `aggregate`,
-set when the aggregated summary's `counts.failed.mean` is greater than
-zero — `pytest_reporter` rewrites `session.exitstatus` to 0 even on test
-failures, so the per-trial returncodes are not a reliable signal.
+For `run`, set when `pytest` exited non-zero or its report records failures.
+For `trials` / `aggregate`, set when the aggregated summary's
+`counts.failed.mean` is greater than zero — `pytest_reporter` rewrites
+`session.exitstatus` to 0 even on test failures.
 """
 
 EXIT_CONFIG = 2
 """Bad CLI arguments, missing env vars, or unknown discovery values."""
 
 EXIT_NO_REPORTS = 3
-"""No readable reports were produced; nothing to aggregate."""
+"""No readable report was produced."""
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 """`libs/evals/deepagents_evals/`."""
@@ -244,7 +247,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     raise AssertionError(msg)
 
 
-def _build_single_trial_argv(args: argparse.Namespace) -> list[str]:
+def _build_single_trial_argv(args: argparse.Namespace, *, report: Path | None = None) -> list[str]:
     """Build the `pytest tests/evals` argv for a single-trial run.
 
     Mirrors `make evals` but adds optional report path and lets every flag from
@@ -262,7 +265,7 @@ def _build_single_trial_argv(args: argparse.Namespace) -> list[str]:
         "--model",
         args.model,
     ]
-    if args.report:
+    if args.report and report is None:
         cmd.extend(["--evals-report-file", str(args.report)])
     for cat in args.eval_category or []:
         cmd.extend(["--eval-category", cat])
@@ -278,6 +281,8 @@ def _build_single_trial_argv(args: argparse.Namespace) -> list[str]:
         cmd.append("--openrouter-allow-fallbacks")
     if args.repl:
         cmd.extend(["--repl", args.repl])
+    if report is not None:
+        cmd.extend(["--evals-report-file", str(report)])
     cmd.extend(args.pytest_extra)
     return cmd
 
@@ -328,7 +333,17 @@ def _cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return EXIT_OK
     env = os.environ.copy()
     env.setdefault("LANGSMITH_TEST_SUITE", "deepagents-evals")
-    result = subprocess.run(cmd, cwd=_EVALS_DIR, env=env, check=False)
+    with TemporaryDirectory() as report_dir:
+        report = Path(report_dir) / "evals_report.json"
+        cmd = _build_single_trial_argv(args, report=report)
+        result = subprocess.run(cmd, cwd=_EVALS_DIR, env=env, check=False)
+        if args.report and report.exists():
+            output = args.report if args.report.is_absolute() else _EVALS_DIR / args.report
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(report, output)
+        report_exit = (
+            _exit_code_from_run_report(report) if result.returncode == 0 else EXIT_EVAL_FAILURES
+        )
     if args.json:
         _emit_json(
             {
@@ -337,9 +352,20 @@ def _cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 "report": str(args.report) if args.report else None,
             }
         )
-    if result.returncode == 0:
-        return EXIT_OK
-    return EXIT_EVAL_FAILURES
+    return report_exit
+
+
+def _exit_code_from_run_report(report: Path) -> int:
+    """Read this run's report because the pytest plugin masks eval failures."""
+    try:
+        failed = json.loads(report.read_text(encoding="utf-8"))["failed"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        print(f"warning: could not read {report}: {exc}", file=sys.stderr)
+        return EXIT_NO_REPORTS
+    if not isinstance(failed, int) or isinstance(failed, bool) or failed < 0:
+        print(f"warning: invalid failed count in {report}: {failed!r}", file=sys.stderr)
+        return EXIT_NO_REPORTS
+    return EXIT_EVAL_FAILURES if failed else EXIT_OK
 
 
 def _import_run_trials() -> Any:

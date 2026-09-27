@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import json
 import subprocess
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
 from deepagents_evals import cli
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 @pytest.fixture(autouse=True)
@@ -283,6 +280,7 @@ class TestExitCodeMapping:
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         def fake_run(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[bytes]:
+            Path(cmd[cmd.index("--evals-report-file") + 1]).write_text('{"failed": 0}')
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         monkeypatch.setattr(cli.subprocess, "run", fake_run)
@@ -290,6 +288,46 @@ class TestExitCodeMapping:
         assert rc == cli.EXIT_OK
         payload = json.loads(capsys.readouterr().out)
         assert payload["returncode"] == 0
+
+    def test_run_failed_report_returns_eval_failures(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        output = tmp_path / "reports" / "evals.json"
+        output.parent.mkdir()
+        output.write_text('{"failed": 0}')
+
+        def fake_run(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[bytes]:
+            Path(cmd[cmd.index("--evals-report-file") + 1]).write_text('{"failed": 1}')
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        monkeypatch.setattr(cli.subprocess, "run", fake_run)
+        rc = cli.main(["run", "--model", "openai:gpt-5.5", "--report", str(output)])
+        assert rc == cli.EXIT_EVAL_FAILURES
+        assert json.loads(output.read_text()) == {"failed": 1}
+
+    def test_run_without_report_fails_on_failed_eval(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        reports: list[Path] = []
+
+        def fake_run(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[bytes]:
+            assert cmd.index("--evals-report-file") < cmd.index("-k")
+            report = Path(cmd[cmd.index("--evals-report-file") + 1])
+            report.write_text('{"failed": 1}')
+            reports.append(report)
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        monkeypatch.setattr(cli.subprocess, "run", fake_run)
+        rc = cli.main(["run", "--model", "openai:gpt-5.5", "--", "-k", "memory"])
+        assert rc == cli.EXIT_EVAL_FAILURES
+        assert not reports[0].exists()
+
+    def test_run_missing_report_is_not_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            cli.subprocess,
+            "run",
+            lambda cmd, **_kw: subprocess.CompletedProcess(args=cmd, returncode=0),
+        )
+        rc = cli.main(["run", "--model", "openai:gpt-5.5"])
+        assert rc == cli.EXIT_NO_REPORTS
 
     def test_run_subprocess_nonzero_maps_to_eval_failures(
         self, monkeypatch: pytest.MonkeyPatch
